@@ -1,9 +1,13 @@
 import {
+  createAssistantMessageEventStream,
   getEnvApiKey,
   isArkSchema,
   streamSimple,
+  type AssistantMessage,
+  type Context,
   type CustomStreamSimpleFn,
   type ImageContent,
+  type SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { ConfigurationError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -17,6 +21,16 @@ export const API_ID = "antigravity-cli";
 const identity = z.object({ token: z.string() });
 const part = z.record(z.string(), z.json());
 type Part = z.infer<typeof part>;
+const nativeToolAliases = [
+  ["read", "read_file"],
+  ["bash", "run_command"],
+  ["write", "write_file"],
+  ["edit", "edit_file"],
+  ["task", "invoke_subagent"],
+  ["web_search", "search_web"],
+  ["ask", "ask_question"],
+  ["apply_patch", "edit_file"],
+] as const;
 
 function signature(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -35,9 +49,69 @@ function inlineImage(image: ImageContent): Part {
   };
 }
 
+function toolNames(context: Context, choice: SimpleStreamOptions["toolChoice"]) {
+  const originals = new Set(context.tools?.map((tool) => tool.name));
+  for (const message of context.messages) {
+    if (message.role !== "assistant") continue;
+    for (const block of message.content) {
+      if (block.type === "toolCall") originals.add(block.name);
+    }
+  }
+  if (choice && typeof choice !== "string" && choice.type !== "computer") {
+    const name = "function" in choice ? choice.function.name : choice.name;
+    if (name) originals.add(name);
+  }
+  const outgoing = new Map<string, string>();
+  const incoming = new Map<string, string>();
+  for (const [original, alias] of nativeToolAliases) {
+    // Reserve every original identity, including history-only/custom tools.
+    if (
+      !originals.has(original) ||
+      originals.has(alias) ||
+      (original === "apply_patch" && originals.has("edit"))
+    )
+      continue;
+    outgoing.set(original, alias);
+    incoming.set(alias, original);
+  }
+  return {
+    toNative: (name: string) => outgoing.get(name) ?? name,
+    fromNative: (name: string) => incoming.get(name) ?? name,
+  };
+}
+
+/** Change only identity text in the final system instruction, after other extensions. */
+function nativeBranding(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object" || !("request" in payload)) return payload;
+  const request = payload.request;
+  if (!request || typeof request !== "object" || !("systemInstruction" in request)) return payload;
+  const instruction = request.systemInstruction;
+  if (!instruction || typeof instruction !== "object" || !("parts" in instruction)) return payload;
+  if (!Array.isArray(instruction.parts)) return payload;
+  let changed = false;
+  const parts = instruction.parts.map((part: unknown) => {
+    if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string")
+      return part;
+    const text = part.text
+      .replace(
+        /^(⁂ Role\r?\n)You are omp's trusted coding assistant\.(?=\r?$)/m,
+        "$1You are Antigravity's trusted coding assistant.",
+      )
+      .replace(/^You are omp(?=, a coding agent[. ])/m, "You are Antigravity")
+      .replace(/^(## )OMP (todo updates|shell execution)(?=\r?$)/gm, "$1Antigravity $2");
+    if (text === part.text) return part;
+    changed = true;
+    return { ...part, text };
+  });
+  return changed
+    ? { ...payload, request: { ...request, systemInstruction: { ...instruction, parts } } }
+    : payload;
+}
+
 /** Preserve original options and messages before the shared CCA builder rewrites them. */
-export const streamAntigravity: CustomStreamSimpleFn = (model, context, options) =>
-  streamSimple(buildModel({ ...toModelSpec(model), api: "google-gemini-cli" }), context, {
+export const streamAntigravity: CustomStreamSimpleFn = (model, context, options) => {
+  const names = toolNames(context, options?.toolChoice);
+  const source = streamSimple(buildModel({ ...toModelSpec(model), api: "google-gemini-cli" }), context, {
     ...options,
     onPayload: async (payload) => {
       const parsed = envelope.parse(payload);
@@ -118,12 +192,13 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
           if (text.trim()) parts.push({ text });
           for (const block of message.content) {
             if (block.type === "toolCall") {
-              callNames.set(block.id, block.name);
+              const name = names.toNative(block.name);
+              callNames.set(block.id, name);
               const thoughtSignature = signature(block.thoughtSignature);
               parts.push({
                 functionCall: {
                   ...(block.id ? { id: block.id } : {}),
-                  ...(block.name ? { name: block.name } : {}),
+                  ...(name ? { name } : {}),
                   args: z.record(z.string(), z.json()).parse(block.arguments),
                 },
                 ...(thoughtSignature ? { thoughtSignature } : {}),
@@ -170,7 +245,7 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
         tools: context.tools?.map((tool) => ({
           functionDeclarations: [
             {
-              name: tool.name,
+              name: names.toNative(tool.name),
               description: tool.description,
               parameters: z.json().parse(
                 JSON.parse(
@@ -194,7 +269,7 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
       const choice = options?.toolChoice;
       if (choice) {
         let mode: string;
-        let names: string[] | undefined;
+        let allowedFunctionNames: string[] | undefined;
         if (typeof choice === "string") {
           if (choice === "auto") mode = "VALIDATED";
           else if (choice === "required" || choice === "any") mode = "ANY";
@@ -205,13 +280,45 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
             throw new ConfigurationError("Native Antigravity tool choice requires a function");
           const name = "function" in choice ? choice.function.name : choice.name;
           mode = "ANY";
-          if (name) names = [name];
+          if (name) allowedFunctionNames = [names.toNative(name)];
         }
         request.toolConfig = {
-          functionCallingConfig: { mode, ...(names ? { allowedFunctionNames: names } : {}) },
+          functionCallingConfig: { mode, ...(allowedFunctionNames ? { allowedFunctionNames } : {}) },
         };
       }
       const native = nativeWireRequest({ ...parsed, request });
-      return (await options?.onPayload?.(native, model)) ?? native;
+      return nativeBranding((await options?.onPayload?.(native, model)) ?? native);
     },
   });
+  const output = createAssistantMessageEventStream();
+  const restore = (message: AssistantMessage): AssistantMessage => ({
+    ...message,
+    // Providers reuse their partial message/array/calls; never rename those in place.
+    content: message.content.map((block) =>
+      block.type === "toolCall" ? { ...block, name: names.fromNative(block.name) } : block,
+    ),
+  });
+  output.forwardLocalWorkFrom(source);
+  void (async () => {
+    try {
+      for await (const event of source) {
+        if (event.type === "done") output.push({ ...event, message: restore(event.message) });
+        else if (event.type === "error") output.push({ ...event, error: restore(event.error) });
+        else if (event.type === "toolcall_end")
+          output.push({
+            ...event,
+            partial: restore(event.partial),
+            toolCall: { ...event.toolCall, name: names.fromNative(event.toolCall.name) },
+          });
+        else output.push({ ...event, partial: restore(event.partial) });
+      }
+      if (output.resultSettled) output.end();
+      else output.end(restore(await source.result()));
+    } catch (error) {
+      output.fail(error);
+    } finally {
+      output.forwardLocalWorkFrom(undefined);
+    }
+  })();
+  return output;
+};

@@ -1,4 +1,79 @@
-# agy 1.5.6 protocol audit
+# AGY protocol audits
+
+## Extension scope
+
+The package registers only the Antigravity extension (`index.ts`). The experimental AI Studio provider, its tests, and its bundled Go/Camoufox runtime were removed. Shared dependencies and external account/session data are unchanged.
+
+## Current reference: agy 1.5.9
+
+Updated on 2026-11-14 from the [official macOS ARM64 release manifest](https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/darwin_arm64.json), which advertised 1.5.9. The release archive SHA-512 matched `690cd6a5a5fdb23564fb1b14f7f6ae368fa3636b7630f56c574a6dfc0e2791a0e5b93d6515be1650c8a268cfb28440e1b9cbaa1c5b85aa762ab25b51c1fccda5` before installation. Installed `agy --version` reports 1.5.9; its SHA-256 matches the extracted official binary: `fad3628ad91fe8613a72f074a1c5fde7cd816517788a5b9be96703f7d256741a`. The old binary is retained at `/tmp/agy-159.eqzYFI/agy-1.5.8` for comparison.
+
+The extension now emits:
+
+```http
+User-Agent: antigravity/cli/1.5.9 (aidev_client; os_type=darwin; arch=arm64; cl=1021519450; auth_method=consumer)
+```
+
+Fresh REA analysis covered 18 selected HTTP/header/transport/OAuth/body-construction functions. Address-normalized pseudocode and ordered referenced literals match 1.5.8; original transport/TLS/client field tables and selected defaults corroborate the comparison. This is bounded contract evidence, not a proof of whole-program equivalence. Recovered changes are the default version and client CL; the compiler build is unchanged. HTTP/1-only selection, connection defaults, conditional header/UA fields, chunked generation and non-replayable generation 307/308 behavior remain as documented below.
+
+New evidence:
+
+- `/tmp/agy-159.eqzYFI/go-metadata.json`: `ev_71c409fb339b816d9ab7b82e8198940b227603d75f9a4d9fc667c4a262452c70`.
+- `/tmp/agy-159.eqzYFI/http/http-contract-comparison.json` and `http/findings.json`.
+- `setHeaders`, VA `0x102145da0`: `ev_9dc7a5fa7bb63cc0c9648905c7c0560d2fd581a652f2f88d2027762ecd42653e`.
+- `userAgent`, VA `0x1021454d0`: `ev_c91542b185e2a8e811e04e3f3a5ce3e002db3a965b2e902b01150b9c278f757f`.
+- `newCloudCodeTransport`, VA `0x102144230`: `ev_8df058b4d3e061c0ef489f91335e90d94fd036b4cfdd2f68bb9fe65f56be96fc`.
+- CCPA streaming body, VA `0x10213e6a0`: `ev_f374e9dc5762cb13ed5b56eff383b9be09f37fa9ff0dd586317a5da6e8fd8a89`.
+
+Fresh native capture `/tmp/agy-159.eqzYFI/native-wire.json` again stopped the required OAuth refresh locally with 418. Its parsed ClientHello fields, HTTP/1.1 negotiation and OAuth header names/order/values match the earlier native observation. No native CCPA request or successful token refresh was obtained. Extension capture `extension-wire.json` verifies four HTTPS request types using the registered 1.5.9/CL identity, ordinary Content-Length, chunked generation, no GET framing and no automatic Connection header. The remaining TLS-stack and proxy timing differences below are unchanged. Relevant extension/protocol/transport tests passed: 59 tests, 0 failures; TypeScript checking passed.
+
+The targeted device comparison covered 44 functions (9,880 ARM64 instructions), nine relevant type contracts, and 14 fresh REA slices. Address relocations and five verified `Server` field-offset changes account for the observed instruction differences; direct-call identities and the inspected identity field/string contracts remain unchanged. `Server` gained workspace-trust/memory-monitor fields, shifting the existing trajectory-store and session-hostname slots rather than introducing a new identifier source. Generation still has no dedicated hardware/installation field in the examined schemas/builders; random installation UUID, inherited analytics `machineId`, CEL installation logging and conditional hostname paths retain the prior split. Hostname-flag activation and arbitrary inherited fingerprint provenance remain unresolved. Evidence: `/tmp/agy-159.eqzYFI/device/device-identity-comparison.json`; installation `ev_047e7bd07f71bacc2021252133524cd1a252f1d47221bbd632f14e967fe888d5`; analytics `ev_fdf410ce112d203e9fa2da0d31b976afa14ca39d6523396a5b6bf9e206078f36`; generation builder `ev_cb56c73cc624fac352b722457322f18e7741d8879bfc47c818d55e94372c049f`.
+
+## Previous reference: agy 1.5.8
+
+Audited on 2026-11-14: Darwin arm64 `~/.local/bin/agy`, 235,205,648 bytes, SHA-256 `b127126993e1c5b7e0b1ef80fa9bbe6955ddb85a5d76a3310b6096acc7eb000a`. REA Go metadata identifies Google's `go1.28-20261102-RC00 cl/1012564305 +298f53e483 X:fieldtrack,boringcrypto,simd,nogolistexportnewformat`. That compiler CL is not the client CL.
+
+The current Cloud Code transport is **HTTP/1-only**, superseding the earlier 1.5.6 HTTP/2 observation below. `newCloudCodeTransport` explicitly sets `Transport.Protocols` to HTTP/1, clears `TLSNextProto`, and removes `h2` from TLS ALPN. It reuses transports, raises `MaxIdleConnsPerHost` to 100, and leaves the response-header timeout at zero. Inherited defaults include 100 global idle connections, a 90-second idle timeout, a 30-second TCP dial timeout/keepalive interval, and a 10-second TLS handshake timeout. A new ordinary TLS config has no client session cache or explicit cipher/curve overrides.
+
+The default consumer CLI identity recovered from `main.initMetadata` and `CodeAssistClient.userAgent` is:
+
+```http
+User-Agent: antigravity/cli/1.5.8 (aidev_client; os_type=darwin; arch=arm64; cl=1020628950; auth_method=consumer)
+```
+
+The generation body is a `bytes.Reader` wrapped in `io.NopCloser` before Go's `NewRequestWithContext` sees it. That wrapper prevents the known-length/GetBody special case: native generation is chunked over HTTP/1, and nonempty generation bodies are not replayed on 307/308 redirects. Ordinary JSON control-plane and form OAuth requests have known byte lengths.
+
+`setHeaders` sets the User-Agent and JSON Content-Type for POST; OAuth supplies Authorization. Request context can additionally supply `X-Goog-Request-Reason` and a matching UA `purpose`, and the CLI auth provider can supply `X-Goog-User-Project`. The native UA has conditional privacy/host/proxy fields; their defaults were not established, so the extension does not invent them. No explicit Accept, X-Goog-Api-Client, X-Client-Data, or hardware-fingerprint header was found in this analyzed consumer header-construction path.
+
+Runtime evidence is deliberately separate from static evidence. A loopback-only receiver and OS network restriction captured native `agy models`; the installed account required refresh, so the receiver stopped its OAuth `/token` request with HTTP 418 rather than forwarding it or returning a token. Observed ALPN was `http/1.1`, with `Go-http-client/1.1`, form Content-Type, Content-Length and gzip. No live CCPA generation or successful OAuth refresh was performed. Separate telemetry connections offered `h2,http/1.1`; their transport must not be confused with the Cloud Code transport. The capture used `GODEBUG=netdns=go` only to resolve localhost under the network restriction.
+
+**TLS fingerprint limit:** the original Bun implementation and AGY advertise TLS 1.2/1.3, but their ClientHello cipher ordering, extension ordering, supported groups and signature algorithms differ. Native AGY advertises groups 4588/4587/4589/29/23/24/25 and signature extensions 13 and 50; the captured Bun stack advertises 4588/29/23/24 and no extension 50. An HTTP version/header correction does not recreate Google's private Go/BoringCrypto build. Certificate checks remain enabled; no guessed fingerprint, fabricated hardware ID, or weaker TLS policy is added to conceal this difference.
+
+The updated extension's local HTTPS capture negotiated `http/1.1` for control, generation, userinfo and OAuth-token requests. It emitted the current CLI UA, UTF-8 Content-Length for control/token bodies, chunked generation, and no GET body framing. Public request options suppress Node's automatic Connection header without disabling reuse; the final capture's OAuth header names/order and noncredential values match the native observation, apart from the fixture's body length. Capture: `/tmp/agy-extension-after-transport.json`; all tokens/bodies were local fixtures and the receiver returned 418 without upstream dispatch. Current CCPA header construction is supported by static REA evidence plus extension readback, not a successful native CCPA capture.
+
+Connection pools preserve proxy, CA, client-certificate and identity-callback isolation, disable TLS session caching, expire free sockets after 90 seconds, and cap idle sockets at 100 per transport across its origins without limiting active streams. Direct connections use separate 30-second TCP and 10-second TLS-handshake deadlines; active SSE has no finite response deadline. **Proxy timing limit:** OMP's CONNECT helper exposes only a whole-tunnel promise/timeout, so native per-stage proxy connection deadlines are not reproduced. Cancellation and final extension shutdown abort pending tunnels and close pooled sockets.
+
+Verification: the initial transport/extension/protocol run passed 56 tests. After lifetime/header refinements, all 42 transport tests passed, including framing, reuse, idle limits, direct deadlines, TLS/client-certificate isolation, proxy cancellation and generation redirect non-replay. Type checking passed after correcting timer-test overload annotations; the two affected deadline tests passed again. Final HTTPS wire capture covered four local request types. Throwaway capture scripts were removed.
+
+### Device identifiers are not interchangeable
+
+The recovered CCPA outer/nested request types and analyzed builder/header paths do not attach hardware or installation metadata. The session helper hashes an input string with FNV-1a64; it does not query hardware. Separately, CLI `setUpInstallationID` reads or creates a random UUIDv4 in `~/.gemini/antigravity-cli/installation_id` (under configurable app-data roots). Error diagnostics serialize that UUID as `AntigravityExtension.installation_id` field 5 to the separate CEL/Clearcut path targeting `https://play.googleapis.com/log`.
+
+Analytics additionally copy `Metadata.DeviceFingerprint` into `extras["machineId"]`; this is a different field from the installation UUID. Ordinary CLI metadata initialization sets IDE name/version/product, not a hardware fingerprint, but metadata can be inherited from a Protobuf stdin input. A linked OTel Darwin collector can query `IOPlatformUUID`; its execution/transmission in the CLI was not established, and the recovered default detector list does not include host-ID collection. A generation prompt section can conditionally include the OS hostname, while remote control has its own hostname-derived instance name. Neither flag activation nor universal identifier absence is claimed.
+
+No installation UUID, hardware UUID, hostname, or credential value was queried or copied into the extension for this analysis. The extension retains its actual OS/architecture and established session contract; it does not manufacture analytics or remote-control requests. Device evidence: `/tmp/agy-device-158.EJebv3/device-identity-manifest.json`; installation `ev_46ce8d3fd662ca53f74a64864669c0911aaf92fa989e1611514d773751a6b980`; analytics `ev_d875afa6928708ec05cf4a399d27fcaf8554ee8b3e8bff154aa72532cfc84316`; CEL transmission `ev_fdabb3cdcbb83d6521f1d634a94006dd700f00e32748b3fe28a8aa5ddd657b89`.
+
+REA evidence: `/tmp/agy-http-158.WuX4W1/http-contract-evidence.json`; native runtime capture (credential values omitted): `/tmp/agy-native-158-transport.json`; pre-change extension capture: `/tmp/agy-extension-before-transport.json`.
+
+| Native function | Address | REA evidence |
+| --- | --- | --- |
+| `newCloudCodeTransport` | `0x10210eb40` | `ev_73bb10941250f785bb37629a0fee1ff70980089ea0944a07711e855610137ec3` |
+| `CodeAssistClient.setHeaders` | `0x1021106b0` | `ev_6d7fa945f5dac311018dab519ad5ee88c7ee8a83dd91a5a8e0300b587e919e0a` |
+| `codeassistclient.userAgent` | `0x10210fde0` | `ev_24fd790086177c3db804f0417888f59e7c0f8028ff8f56e011adbdf0f3fa87d1` |
+
+## Historical reference: agy 1.5.6
+
+The remaining native-capture sections describe the 2026-11-12/13 evidence. The 1.5.8 section above supersedes their version, client CL and HTTP/2 transport claims; the older captures are not rewritten as if they came from the current binary.
 
 Official installer: <https://antigravity.google/cli/install.sh>. Authentication documentation: <https://antigravity.google/docs/install?tab=cli>.
 
@@ -84,6 +159,12 @@ This follow-up used REA function slices, original-file data and static LLDB disa
 The request uses the routed model ID and its roster `model` as `labels.model_enum`. A supplied Google thinking level wins over the roster level; a nonzero level excludes `thinkingBudget`. Otherwise the roster's normal or minimum budget is emitted, including explicit zero. `includeThoughts` follows thinking support/suppression. The maximum comes from an explicit total-output option, otherwise the roster cap.
 
 Tool declarations use one entry per function. Native Schema conversion keeps only type, description, properties, items, valid required names, string enum positions, default, format, pattern and the supported numeric bounds. It drops combiners, nullable, title and other unassigned fields. Length/item bounds truncate to int64 and serialize as decimal strings. Empty ordinary fields omit; explicit defaults and allocated empty child schemas survive. For thinking levels `EXTRA_HIGH=5` and `MAX=6`, all populated protobuf enums use numbers; `XHIGH=7` retains names. Arbitrary JSON function arguments, responses and defaults are not enum-rewritten.
+
+Server-visible tool names are adapted: `read` → `read_file`, `bash` → `run_command`, `write` → `write_file`, `edit` → `edit_file`, `task` → `invoke_subagent`, `web_search` → `search_web`, and `ask` → `ask_question`. `apply_patch` → `edit_file` applies only when `edit` is absent. Each request derives a reversible map from declarations, historical assistant calls and any named choice; original names reserve their identity, so an occupied alias conservatively leaves the OMP name unchanged rather than merging tools. Unknown/custom/MCP names stay unchanged. Declarations, historical calls, ID-paired responses and explicit allowed names use this map; all streamed partials, completed calls and final/error messages restore OMP names. This is names-only compatibility, not AGY argument/schema/execution compatibility: arguments, results, signatures and internal sessions remain unchanged.
+
+System-prompt branding is applied only after the caller's awaited `onPayload` hook has finished. The host's `⁂ Role` introduction changes from `You are omp's trusted coding assistant.` to `You are Antigravity's trusted coding assistant.` in the outgoing `request.systemInstruction` only. Known ULW preset introductions beginning `You are omp, a coding agent` and the `OMP todo updates` / `OMP shell execution` headings receive the same branding; model names, specialist roles and all following instructions stay intact. The original context and hook-owned objects are not mutated. Commands, paths, package names, workflow and safety instructions, user messages and tool descriptions are not globally searched or rewritten. This does not import AGY's full system prompt or advertise its unimplemented runtime features.
+
+The companion `omp-ulw` payload adapter recognizes `antigravity-cli` as a nested Google request and recognizes aliased `invoke_subagent` / `run_command` names for its existing guidance projection. Its `<omp-model-preset>` and `<omp-ulw-policy>` markers remain unchanged. A local HTTP receiver probe exercised the actual ULW turn-start/request hooks with Antigravity in both hook orders and main/subagent scopes: stale presets and main-session policies refreshed, specialist restrictions survived, and only the listed branding text changed after the hooks. The probe used fake credentials and was removed afterward; no upstream inference was performed.
 
 Calls/results preserve their original IDs. Consecutive results form one turn, using role `user` for `API_PROVIDER_ANTHROPIC_VERTEX=26`, otherwise `model`. Result names come from preceding calls. Images use inline MIME/data, including images nested inside function responses; image-only results retain an empty output string. No forced-tool instruction, remote image reference or bypass thought signature is invented. User whitespace survives. System instructions always have role `user` and one text part, including empty text.
 

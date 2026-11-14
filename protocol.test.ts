@@ -180,7 +180,7 @@ test("leaves requests without an Antigravity chat model unchanged", () => {
 });
 
 test("sends the audited native identity and agent envelope on an actual HTTP request", async () => {
-  // Captured from the official agy 1.5.6 binary, including its embedded CL.
+  // Recovered from the official agy 1.5.9 metadata and User-Agent assignments.
   process.env.PI_AI_ANTIGRAVITY_VERSION = "2.26.0";
   process.env.PI_AI_ANTIGRAVITY_CL = "1005016104";
   let payloadHook: unknown;
@@ -247,7 +247,7 @@ test("sends the audited native identity and agent envelope on an actual HTTP req
       if (event.type === "error") throw new Error(event.error.errorMessage);
     }
     expect(headers.get("user-agent")).toBe(
-      "antigravity/cli/1.5.6 (aidev_client; os_type=darwin; arch=arm64; cl=1018951551; auth_method=consumer)",
+      "antigravity/cli/1.5.9 (aidev_client; os_type=darwin; arch=arm64; cl=1021519450; auth_method=consumer)",
     );
     expect(headers.has("accept")).toBe(false);
     expect(headers.has("anthropic-beta")).toBe(false);

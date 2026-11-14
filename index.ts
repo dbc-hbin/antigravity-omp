@@ -6,7 +6,7 @@ import { createOAuthCodeLogin, resolveValue } from "./oauth-engine.js";
 import { nativeAgentRequest, type ProtocolContext } from "./protocol";
 import { clearNativeModels, rememberNativeModels } from "./native-models";
 import { API_ID, streamAntigravity } from "./stream";
-import { antigravityFetch } from "./transport";
+import { antigravityFetch, closeAntigravityTransport } from "./transport";
 
 const PROVIDER_ID = "google-antigravity";
 const LABEL = "Google Antigravity (Gemini, Claude, GPT-OSS)";
@@ -71,9 +71,9 @@ function structuredApiKey(credentials: OAuthCredentials): string {
 }
 
 export default function antigravityExtension(pi: ExtensionAPI): void {
-  // Official agy 1.5.6, SHA256 c55b821d...2dc753a; verified over HTTP/2.
-  process.env.PI_AI_ANTIGRAVITY_VERSION = "1.5.6";
-  process.env.PI_AI_ANTIGRAVITY_CL = "1018951551";
+  // Official agy 1.5.9, SHA256 fad3628a...256741a; native metadata/UA assignments.
+  process.env.PI_AI_ANTIGRAVITY_VERSION = "1.5.9";
+  process.env.PI_AI_ANTIGRAVITY_CL = "1021519450";
   const builtIn = getProviderDefinition(PROVIDER_ID);
   const policy = authPolicyFor(PROVIDER_ID);
   const rule = policy?.login;
@@ -147,6 +147,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (globalThis.fetch === installation.current) globalThis.fetch = installation.previous;
       fetchInstallation = undefined;
       clearNativeModels();
+      closeAntigravityTransport();
     }
   });
   pi.on("before_provider_request", (event, context) => nativeAgentRequest(event.payload, context));

@@ -23,8 +23,7 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts",
-      "./aistudio-provider.ts"
+      "./index.ts"
     ]
   }
 }

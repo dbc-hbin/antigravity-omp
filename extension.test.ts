@@ -16,9 +16,9 @@ const cases: { id: string; choice?: ToolChoice; mode?: string; names?: string[] 
   { id: "claude-sonnet-5-5", choice: "required", mode: "ANY" },
   {
     id: "claude-sonnet-5-5",
-    choice: { type: "function", name: "inspect" },
+    choice: { type: "function", name: "read" },
     mode: "ANY",
-    names: ["inspect"],
+    names: ["read_file"],
   },
   { id: "claude-sonnet-4-6", choice: "auto", mode: "VALIDATED" },
 ];
@@ -73,7 +73,7 @@ test.each(cases)(
       const discovery = await fetch(new URL("/v1internal:fetchAvailableModels", server.url), {
         method: "POST",
         headers: {
-          "User-Agent": "antigravity/hub/1.5.6",
+          "User-Agent": "antigravity/hub/1.5.9",
           Authorization: "Bearer local-test-token",
           "Content-Type": "application/json",
         },
@@ -125,7 +125,7 @@ test.each(cases)(
       }
       expect((await stream.result()).content).toContainEqual({ type: "text", text: "OK" });
       expect(headers.get("user-agent")).toBe(
-        "antigravity/cli/1.5.6 (aidev_client; os_type=darwin; arch=arm64; cl=1018951551; auth_method=consumer)",
+        "antigravity/cli/1.5.9 (aidev_client; os_type=darwin; arch=arm64; cl=1021519450; auth_method=consumer)",
       );
       expect(headers.has("accept")).toBe(false);
       expect(headers.has("anthropic-beta")).toBe(false);
@@ -166,10 +166,11 @@ test.each(cases)(
       expect(wire.request.toolConfig?.functionCallingConfig).toEqual(
         mode ? { mode, ...(names ? { allowedFunctionNames: names } : {}) } : undefined,
       );
-      expect(wire.request.tools).toHaveLength(2);
-      expect(wire.request.tools?.every((tool) => tool.functionDeclarations.length === 1)).toBe(
-        true,
-      );
+      expect(
+        wire.request.tools?.flatMap((tool) =>
+          tool.functionDeclarations.map((declaration) => declaration.name),
+        ),
+      ).toEqual(["inspect", "read_file"]);
     } finally {
       await server.stop(true);
     }
