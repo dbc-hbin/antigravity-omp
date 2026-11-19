@@ -1,12 +1,17 @@
 import { expect, test } from "bun:test";
 import {
   streamSimple,
+  validateToolArguments,
   type AssistantMessage,
   type AssistantMessageEvent,
   type Context,
   type SimpleStreamOptions,
+  type Tool,
 } from "@oh-my-pi/pi-ai";
 import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadExtension } from "./extension-fixture";
 import { rememberNativeModels } from "./native-models";
 
@@ -256,7 +261,7 @@ test.each([
           functionCall: { id: "call/one", name: "inspect", args: { type: "object" } },
           thoughtSignature: "c2ln",
         },
-        { functionCall: { id: "call/two", name: "read_file", args: {} } },
+        { functionCall: { id: "call/two", name: "read", args: {} } },
       ],
     },
     {
@@ -270,7 +275,7 @@ test.each([
             parts: [{ inlineData: { mimeType: image.mimeType, data: image.data } }],
           },
         },
-        { functionResponse: { id: "call/two", name: "read_file", response: { error: "" } } },
+        { functionResponse: { id: "call/two", name: "read", response: { error: "" } } },
       ],
     },
   ]);
@@ -290,7 +295,7 @@ test("drops unsigned thought replay without circulation and does not synthesize 
   expect(body).toHaveProperty("request.contents", [
     {
       role: "model",
-      parts: [{ text: "done" }, { functionCall: { id: "call", name: "read_file", args: {} } }],
+      parts: [{ text: "done" }, { functionCall: { id: "call", name: "read", args: {} } }],
     },
   ]);
 });
@@ -403,12 +408,15 @@ test.each([".", " running on Gemini 4 Argon."])("preserves ULW roles, markers an
   expect(body).toHaveProperty("request.contents", [{ role: "user", parts: [{ text: prompt }] }]);
 });
 
-test("aliases only outbound tool names across declarations, history, paired results and choice", async () => {
+test("keeps declarations, history, paired results and choice consistent across aliases", async () => {
   const originals = [
     "read", "bash", "write", "edit", "task", "web_search", "ask", "apply_patch", "inspect", "mcp__server__read",
   ];
   const native = [
     "read_file", "run_command", "write_file", "edit_file", "invoke_subagent", "search_web", "ask_question", "apply_patch", "inspect", "mcp__server__read",
+  ];
+  const historical = [
+    "read", "run_command", "write", "edit_file", "invoke_subagent", "search_web", "ask_question", "apply_patch", "inspect", "mcp__server__read",
   ];
   const args = { name: "read", text: "bash read_file", nested: { tool: "write" } };
   const context: Context = {
@@ -443,24 +451,35 @@ test("aliases only outbound tool names across declarations, history, paired resu
   expect(body).toMatchObject({
     request: {
       systemInstruction: { role: "user", parts: [{ text: context.systemPrompt?.join("\n\n") }] },
-      tools: native.map((name) => ({
-        functionDeclarations: [{
-          name,
+      tools: originals.flatMap((name, index) => {
+        const host = {
+          name: historical[index],
           description: "read bash write are unchanged description text",
           parameters: { type: "OBJECT", properties: { read: { type: "STRING" } } },
-        }],
-      })),
+        };
+        if (name !== "read" && name !== "write") return [{ functionDeclarations: [host] }];
+        return [
+          {
+            functionDeclarations: [{
+              name: native[index],
+              description: expect.any(String),
+              parameters: { ...host.parameters, properties: expect.any(Object) },
+            }],
+          },
+          { functionDeclarations: [host] },
+        ];
+      }),
       contents: [
         { role: "user", parts: [{ text: "read write_file" }] },
-        { role: "model", parts: native.map((name, index) => ({
+        { role: "model", parts: historical.map((name, index) => ({
           functionCall: { id: `call/${index}`, name, args },
           thoughtSignature: "Y2FsbA==",
         })) },
-        { role: "model", parts: native.map((name, index) => ({
+        { role: "model", parts: historical.map((name, index) => ({
           functionResponse: { id: `call/${index}`, name, response: { output: "read bash read_file" } },
         })) },
       ],
-      toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["read_file"] } },
+      toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["read_file", "read"] } },
     },
   });
   expect(context).toEqual(before);
@@ -476,18 +495,40 @@ test.each([
   { original: "ask", native: "ask_question" },
   { original: "apply_patch", native: "edit_file" },
 ])("restores $native to $original in every partial, toolcall end and final result", async ({ original, native }) => {
-  const args = { path: "read_file", nested: { name: native }, lines: [1, 2] };
-  const call = { type: "toolCall" as const, id: "native/call-id", name: original, arguments: args, thoughtSignature: "Y2FsbA==" };
+  const others = { path: "read_file", nested: { name: native }, lines: [1, 2] };
+  const nativeArgs =
+    original === "read"
+      ? { Path: "notes.txt" }
+      : original === "write"
+        ? { Path: "notes.txt", Content: "text", Overwrite: true }
+        : others;
+  const args =
+    original === "read"
+      ? { path: "notes.txt:raw" }
+      : original === "write"
+        ? { path: "notes.txt", content: "text" }
+        : others;
+  const call = {
+    type: "toolCall" as const,
+    id: "native/call-id",
+    name: original,
+    arguments: args,
+    thoughtSignature: "Y2FsbA==",
+    ...(original === "read" ? { antigravityReadPath: "notes.txt:raw" } : {}),
+  };
   const context: Context = {
     messages: [{ role: "user", content: "Inspect", timestamp: 0 }],
-    tools: [{ name: original, description: "", parameters: { type: "object" } }],
+    tools: [{ name: original, description: "Host tool", parameters: { type: "object" } }],
   };
   const before = structuredClone(context);
   const { body, events, result } = await capture(context, undefined, {}, "gemini-3.8-flash", sse([
-    { functionCall: { id: call.id, name: native, args }, thoughtSignature: call.thoughtSignature },
+    { functionCall: { id: call.id, name: native, args: nativeArgs }, thoughtSignature: call.thoughtSignature },
     { text: "read_file remains literal text" },
   ]));
-  expect(body).toMatchObject({ request: { tools: [{ functionDeclarations: [{ name: native }] }] } });
+  const declaredNames = original === "read" || original === "write" ? [native, original] : [native];
+  expect(body).toMatchObject({
+    request: { tools: declaredNames.map((name) => ({ functionDeclarations: [{ name }] })) },
+  });
   expect(result.stopReason).toBe("toolUse");
   expect(result.content).toEqual([call, { type: "text", text: "read_file remains literal text" }]);
   expect(events.map((event) => event.type)).toContain("toolcall_start");
@@ -520,7 +561,7 @@ test.each([
       { role: "user", parts: [{ text: "Inspect" }] },
       { role: "model", parts: [
         { text: "read_file remains literal text" },
-        { functionCall: { id: call.id, name: native, args }, thoughtSignature: call.thoughtSignature },
+        { functionCall: { id: call.id, name: native, args: nativeArgs }, thoughtSignature: call.thoughtSignature },
       ] },
       { role: "model", parts: [{ functionResponse: { id: call.id, name: native, response: { output: "read_file output" } } }] },
     ] } });
@@ -529,7 +570,7 @@ test.each([
 });
 
 test.each([
-  { choice: { type: "function" as const, name: "read" }, original: "read", native: "read_file" },
+  { choice: { type: "function" as const, name: "read" }, original: "read", native: "read" },
   { choice: { type: "function" as const, function: { name: "web_search" } }, original: "web_search", native: "search_web" },
   { choice: { type: "tool" as const, name: "ask" }, original: "ask", native: "ask_question" },
 ])("derives a reversible mapping from an explicit choice alone: $original", async ({ choice, original, native }) => {
@@ -545,7 +586,7 @@ test.each([
   expect(result.content).toEqual([{ type: "toolCall", id: "choice/call", name: original, arguments: {} }]);
 });
 
-test("derives a reversible mapping from historical calls without declarations", async () => {
+test("keeps host read history and does not activate an undeclared native route", async () => {
   const { body, result } = await capture(
     {
       messages: [
@@ -556,14 +597,42 @@ test("derives a reversible mapping from historical calls without declarations", 
     undefined,
     {},
     "gemini-3.8-flash",
-    sse([{ functionCall: { id: "new/read", name: "read_file", args: { path: "after" } } }]),
+    sse([{ functionCall: { id: "new/read", name: "read_file", args: { Path: "after" } } }]),
   );
   expect(body).not.toHaveProperty("request.tools");
   expect(body).toMatchObject({ request: { contents: [
-    { role: "model", parts: [{ functionCall: { id: "old/read", name: "read_file", args: { path: "before" } } }] },
-    { role: "model", parts: [{ functionResponse: { id: "old/read", name: "read_file", response: { output: "before" } } }] },
+    { role: "model", parts: [{ functionCall: { id: "old/read", name: "read", args: { path: "before" } } }] },
+    { role: "model", parts: [{ functionResponse: { id: "old/read", name: "read", response: { output: "before" } } }] },
   ] } });
-  expect(result.content).toEqual([{ type: "toolCall", id: "new/read", name: "read", arguments: { path: "after" } }]);
+  expect(result.content).toEqual([{ type: "toolCall", id: "new/read", name: "read_file", arguments: { Path: "after" } }]);
+});
+
+test.each([
+  { extra: "encoding", properties: { encoding: { type: "string" } }, expected: ["path", "encoding"] },
+  { extra: "i", properties: {}, expected: ["path"] },
+])("does not advertise a native route that cannot supply required $extra", async ({ extra, properties, expected }) => {
+  const { body } = await capture({
+    tools: [{
+      name: "read",
+      description: "Host read with extra requirements",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, ...properties },
+        required: ["path", extra],
+      },
+    }],
+    messages: [],
+  });
+  expect(body).toMatchObject({
+    request: {
+      tools: [{
+        functionDeclarations: [{
+          name: "read",
+          parameters: { required: expected },
+        }],
+      }],
+    },
+  });
 });
 
 test("keeps native aliases, custom and MCP tools distinct in both directions", async () => {
@@ -626,13 +695,20 @@ test("does not alias apply_patch when edit appears only in history", async () =>
 });
 
 test("restores tool names in error events and error results", async () => {
-  const call = { type: "toolCall" as const, id: "failed/call", name: "read", arguments: { path: "read_file" }, thoughtSignature: "Y2FsbA==" };
+  const call = {
+    type: "toolCall" as const,
+    id: "failed/call",
+    name: "read",
+    arguments: { path: "read_file:raw" },
+    thoughtSignature: "Y2FsbA==",
+    antigravityReadPath: "read_file:raw",
+  };
   const { events, result } = await capture(
     { tools: [{ name: "read", description: "", parameters: { type: "object" } }], messages: [{ role: "user", content: "Inspect", timestamp: 0 }] },
     undefined,
     {},
     "gemini-3.8-flash",
-    sse([{ functionCall: { id: call.id, name: "read_file", args: call.arguments }, thoughtSignature: call.thoughtSignature }], "SAFETY"),
+    sse([{ functionCall: { id: call.id, name: "read_file", args: { Path: "read_file" } }, thoughtSignature: call.thoughtSignature }], "SAFETY"),
   );
   expect(result.stopReason).toBe("error");
   expect(result.content).toEqual([call]);
@@ -644,5 +720,340 @@ test("restores tool names in error events and error results", async () => {
       }
     }
     if (event.type === "toolcall_end") expect(event.toolCall).toEqual(call);
+  }
+});
+
+test("declares and round-trips native read ranges with OMP intent metadata", async () => {
+  const intent = "Reading selected lines";
+  const nativeArgs = { Path: "notes.txt", StartLine: 2, EndLine: 3, i: intent };
+  const context: Context = {
+    tools: [{
+      name: "read",
+      description: "Host read",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" }, i: { type: "string", description: "Concise intent" } },
+        required: ["path", "i"],
+      },
+    }],
+    messages: [{ role: "user", content: "Read", timestamp: 0 }],
+  };
+  const { body, events, result } = await capture(
+    context,
+    undefined,
+    {},
+    "gemini-3.8-flash",
+    sse([{ functionCall: { id: "native/read", name: "read_file", args: nativeArgs } }]),
+  );
+  expect(body).toMatchObject({
+    request: {
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: "read_file",
+              parameters: {
+                type: "OBJECT",
+                properties: {
+                  Path: { type: "STRING", pattern: "^[\\p{L}\\p{M}\\p{N}_. /-]+$" },
+                  StartLine: { type: "INTEGER", minimum: 1, maximum: 9007199254740991 },
+                  EndLine: { type: "INTEGER", minimum: 1, maximum: 9007199254740991 },
+                  i: { type: "STRING", description: "Concise intent" },
+                },
+                required: ["Path", "i"],
+              },
+            },
+          ],
+        },
+        { functionDeclarations: [{ name: "read", parameters: { required: ["path", "i"] } }] },
+      ],
+    },
+  });
+  const call = {
+    type: "toolCall" as const,
+    id: "native/read",
+    name: "read",
+    arguments: { path: "notes.txt:raw:2-3", i: intent },
+    antigravityReadPath: "notes.txt:raw:2-3",
+  };
+  expect(result.stopReason).toBe("toolUse");
+  expect(result.content).toEqual([call]);
+  expect(events.find((event) => event.type === "toolcall_delta")).toMatchObject({
+    delta: JSON.stringify(call.arguments),
+  });
+  expect(events.find((event) => event.type === "toolcall_end")).toMatchObject({ toolCall: call });
+
+  const replay: Context = {
+    ...context,
+    messages: [
+      ...context.messages,
+      result,
+      {
+        role: "toolResult",
+        toolCallId: call.id,
+        toolName: "read",
+        content: [{ type: "text", text: "inside" }],
+        isError: false,
+        timestamp: 0,
+      },
+    ],
+  };
+  const second = await capture(replay);
+  expect(second.result.stopReason).toBe("stop");
+  expect(second.body).toMatchObject({
+    request: {
+      contents: [
+        { role: "user", parts: [{ text: "Read" }] },
+        { role: "model", parts: [{ functionCall: { id: call.id, name: "read_file", args: nativeArgs } }] },
+        {
+          role: "model",
+          parts: [{ functionResponse: { id: call.id, name: "read_file", response: { output: "inside" } } }],
+        },
+      ],
+    },
+  });
+});
+
+const writeTool = {
+  name: "write",
+  description: "Write a local file",
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string" }, content: { type: "string" } },
+    required: ["path", "content"],
+  },
+} satisfies Tool;
+
+test.each(["Executes mounted devices with xd://<tool> and writes local:// scratch.", ""])(
+  "keeps the OMP write route when no local write capability is advertised (%s)",
+  async (description) => {
+    const args = { path: "xd://fixture", content: "{}" };
+    const { body, result } = await capture(
+      { tools: [{ ...writeTool, description }], messages: [] },
+      { toolChoice: { type: "function", name: "write" } },
+      {},
+      "gemini-3.8-flash",
+      sse([{ functionCall: { id: "device", name: "write", args } }]),
+    );
+    expect(body).toMatchObject({
+      request: {
+        tools: [{ functionDeclarations: [{ name: "write", parameters: { required: ["path", "content"] } }] }],
+        toolConfig: { functionCallingConfig: { allowedFunctionNames: ["write"] } },
+      },
+    });
+    expect(result.content).toEqual([{ type: "toolCall", id: "device", name: "write", arguments: args }]);
+  },
+);
+
+test("rejects invalid native writes before host execution without losing valid sibling calls", async () => {
+  const { result } = await capture(
+    { tools: [writeTool], messages: [] },
+    undefined,
+    {},
+    "gemini-3.8-flash",
+    sse([
+      { functionCall: { id: "invalid", name: "write_file", args: { Path: "invalid.txt", Content: "", Overwrite: false } } },
+      { functionCall: { id: "valid", name: "write_file", args: { Path: "valid.txt", Content: "", Overwrite: true } } },
+    ]),
+  );
+  expect(result.stopReason).toBe("toolUse");
+  const [invalid, valid] = result.content;
+  if (invalid?.type !== "toolCall" || valid?.type !== "toolCall") throw new Error("Expected both calls");
+  expect(invalid).toMatchObject({ id: "invalid", name: "write" });
+  expect(() => validateToolArguments(writeTool, invalid)).toThrow("Invalid write_file arguments");
+  expect(validateToolArguments(writeTool, valid)).toEqual({ path: "valid.txt", content: "" });
+});
+
+test("passes a non-directory read path to OMP without failing the stream", async () => {
+  const { result } = await capture(
+    {
+      tools: [{ name: "read", description: "Host read", parameters: { type: "object" } }],
+      messages: [],
+    },
+    { cwd: import.meta.dir },
+    {},
+    "gemini-3.8-flash",
+    sse([{ functionCall: { id: "not-dir", name: "read_file", args: { Path: "package.json/file" } } }]),
+  );
+  expect(result.stopReason).toBe("toolUse");
+  const call = {
+    type: "toolCall" as const,
+    id: "not-dir",
+    name: "read",
+    arguments: { path: "package.json/file:raw" },
+    antigravityReadPath: "package.json/file:raw",
+  };
+  expect(result.content).toEqual([call]);
+});
+
+const searchTools = [
+  { name: "grep", description: "Host grep", parameters: { type: "object" } },
+  { name: "glob", description: "Host glob", parameters: { type: "object" } },
+] satisfies Tool[];
+
+test.each(["workspace", "workspace (fixture)"])(
+  "checks canonical search targets without disabling native search in %s",
+  async (workspace) => {
+    const dir = await mkdtemp(join(tmpdir(), "agy-search-"));
+    try {
+      const cwd = join(dir, workspace);
+      const inside = join(cwd, "inside");
+      const outside = join(dir, "outside");
+      await Promise.all([mkdir(inside, { recursive: true }), mkdir(outside)]);
+      await Promise.all([
+        symlink(inside, join(cwd, "internal")),
+        symlink(outside, join(cwd, "external")),
+      ]);
+      const canonicalInside = await realpath(inside);
+      const needsRelativePath = workspace.includes("(");
+      const grepArgs = { Query: "a.b", MatchPerLine: true, IsRegex: false };
+      const { body, result } = await capture(
+        { tools: searchTools, messages: [] },
+        { cwd },
+        {},
+        "gemini-3.8-flash",
+        sse([
+          { functionCall: { id: "grep/inside", name: "grep_search", args: { SearchPath: "internal", ...grepArgs } } },
+          { functionCall: { id: "grep/outside", name: "grep_search", args: { SearchPath: "external", ...grepArgs } } },
+          { functionCall: { id: "glob/outside", name: "find_by_name", args: { SearchDirectory: "external", Pattern: "*.txt" } } },
+          {
+            functionCall: {
+              id: "glob/inside",
+              name: "find_by_name",
+              args: { SearchDirectory: needsRelativePath ? "." : canonicalInside, Pattern: "*.txt" },
+            },
+          },
+        ]),
+      );
+      expect(body).toMatchObject({
+        request: {
+          tools: [
+            { functionDeclarations: [{ name: "grep_search", parameters: { properties: { SearchPath: { type: "STRING" } } } }] },
+            { functionDeclarations: [{ name: "grep" }] },
+            { functionDeclarations: [{ name: "find_by_name", parameters: { properties: { SearchDirectory: { type: "STRING" } } } }] },
+            { functionDeclarations: [{ name: "glob" }] },
+          ],
+        },
+      });
+      expect(result.stopReason).toBe("toolUse");
+      const [valid, rejectedGrep, rejectedGlob, validGlob] = result.content;
+      expect(valid).toEqual({
+        type: "toolCall",
+        id: "grep/inside",
+        name: "grep",
+        arguments: { path: needsRelativePath ? "inside" : canonicalInside, pattern: "a\\.b" },
+      });
+      for (const [call, tool] of [[rejectedGrep, searchTools[0]], [rejectedGlob, searchTools[1]]] as const) {
+        if (call?.type !== "toolCall" || !tool) throw new Error("Expected rejected search call");
+        expect(() => validateToolArguments(tool, call)).toThrow("inside the workspace");
+      }
+      expect(validGlob).toEqual({
+        type: "toolCall",
+        id: "glob/inside",
+        name: "glob",
+        arguments: {
+          path: join(needsRelativePath ? "." : canonicalInside, "**", "*.[tT][xX][tT]"),
+          limit: 50,
+          gitignore: true,
+          hidden: false,
+        },
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("replays only equivalent native searches and pairs both routes with their original results", async () => {
+  const outside = join(import.meta.dir, "..");
+  const outsideGrep = { path: outside, pattern: "word", case: true };
+  const outsideGlob = { path: join(outside, "**", "Readme.md"), limit: 50, gitignore: true, hidden: false };
+  const cases = [
+    {
+      host: "grep", args: { path: ".", pattern: "word.*", case: true },
+      wire: "grep", wireArgs: { path: ".", pattern: "word.*", case: true },
+    },
+    {
+      host: "grep", args: { path: ".", pattern: "word\\.\\*", case: true },
+      wire: "grep_search",
+      wireArgs: { SearchPath: ".", Query: "word.*", MatchPerLine: true, IsRegex: false, CaseInsensitive: false },
+    },
+    {
+      host: "glob", args: { path: "./**/[aB].txt", limit: 50, gitignore: true, hidden: false },
+      wire: "glob", wireArgs: { path: "./**/[aB].txt", limit: 50, gitignore: true, hidden: false },
+    },
+    {
+      host: "glob", args: { path: "./**/Readme.md", limit: 50, gitignore: true, hidden: false },
+      wire: "find_by_name", wireArgs: { SearchDirectory: ".", Pattern: "Readme.md" },
+    },
+    {
+      host: "glob", args: { path: "./**/docs/**/*.txt", limit: 50, gitignore: true, hidden: false },
+      wire: "glob", wireArgs: { path: "./**/docs/**/*.txt", limit: 50, gitignore: true, hidden: false },
+    },
+    { host: "grep", args: outsideGrep, wire: "grep", wireArgs: outsideGrep },
+    { host: "glob", args: outsideGlob, wire: "glob", wireArgs: outsideGlob },
+  ];
+  const { body, result } = await capture({
+    tools: searchTools,
+    messages: [
+      assistant(cases.map(({ host, args }, i) => ({
+        type: "toolCall", id: `search/${i}`, name: host, arguments: args,
+      }))),
+      ...cases.map(({ host }, i) => ({
+        role: "toolResult" as const,
+        toolCallId: `search/${i}`,
+        toolName: host,
+        content: [{ type: "text" as const, text: `result/${i}` }],
+        isError: false,
+        timestamp: 0,
+      })),
+    ],
+  }, { cwd: import.meta.dir });
+  expect(result.stopReason).toBe("stop");
+  expect(body).toHaveProperty("request.contents", [
+    {
+      role: "model",
+      parts: cases.map(({ wire, wireArgs }, i) => ({
+        functionCall: { id: `search/${i}`, name: wire, args: wireArgs },
+      })),
+    },
+    {
+      role: "model",
+      parts: cases.map(({ wire }, i) => ({
+        functionResponse: { id: `search/${i}`, name: wire, response: { output: `result/${i}` } },
+      })),
+    },
+  ]);
+});
+
+test.each([true, false])("keeps literal read history regardless of whether the file still exists (%s)", async (exists) => {
+  const cwd = await mkdtemp(join(tmpdir(), "agy-read-"));
+  try {
+    const path = "notes.txt:raw";
+    const text = "literal filename";
+    await Bun.write(join(cwd, path), text);
+    if (!exists) await rm(join(cwd, path));
+    const { body } = await capture(
+      {
+        tools: [{ name: "read", description: "Host read", parameters: { type: "object" } }],
+        messages: [
+          assistant([{ type: "toolCall", id: "literal", name: "read", arguments: { path } }]),
+          {
+            role: "toolResult", toolCallId: "literal", toolName: "read",
+            content: [{ type: "text", text }], isError: false, timestamp: 0,
+          },
+        ],
+      },
+      { cwd },
+    );
+    expect(body).toHaveProperty("request.contents", [
+      { role: "model", parts: [{ functionCall: { id: "literal", name: "read", args: { path } } }] },
+      {
+        role: "model",
+        parts: [{ functionResponse: { id: "literal", name: "read", response: { output: text } } }],
+      },
+    ]);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
   }
 });

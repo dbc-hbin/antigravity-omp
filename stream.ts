@@ -8,12 +8,15 @@ import {
   type CustomStreamSimpleFn,
   type ImageContent,
   type SimpleStreamOptions,
+  type Tool,
+  type ToolCall,
 } from "@oh-my-pi/pi-ai";
 import { ConfigurationError } from "@oh-my-pi/pi-ai/error";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { mapEffortToGoogleThinkingLevel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { z } from "zod";
+import { toolContracts } from "./tool-contracts";
 import { nativeModelDetails } from "./native-models";
 import { envelope, nativeWireRequest } from "./wire";
 
@@ -21,16 +24,43 @@ export const API_ID = "antigravity-cli";
 const identity = z.object({ token: z.string() });
 const part = z.record(z.string(), z.json());
 type Part = z.infer<typeof part>;
-const nativeToolAliases = [
-  ["read", "read_file"],
+const contractByHost = new Map(toolContracts.map((tool) => [tool.hostName, tool]));
+const nativeToolAliases: readonly (readonly [string, string])[] = [
   ["bash", "run_command"],
-  ["write", "write_file"],
   ["edit", "edit_file"],
   ["task", "invoke_subagent"],
   ["web_search", "search_web"],
   ["ask", "ask_question"],
   ["apply_patch", "edit_file"],
-] as const;
+];
+const schemaFields = z.looseObject({
+  properties: part.optional(),
+  required: z.array(z.string()).optional(),
+});
+const stringProperty = z.looseObject({ type: z.literal("string") });
+
+type ContractRoute = {
+  readonly contract: (typeof toolContracts)[number];
+  readonly intent?: {
+    readonly schema: z.infer<typeof stringProperty>;
+    readonly required: boolean;
+  };
+};
+
+function toolParameters(tool: Tool) {
+  return z.json().parse(
+    JSON.parse(
+      JSON.stringify(
+        isArkSchema(tool.parameters)
+          ? tool.parameters.toJsonSchema({
+              target: "draft-2020-12",
+              fallback: (value) => value.base,
+            })
+          : tool.parameters,
+      ),
+    ),
+  );
+}
 
 function signature(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -49,7 +79,7 @@ function inlineImage(image: ImageContent): Part {
   };
 }
 
-function toolNames(context: Context, choice: SimpleStreamOptions["toolChoice"]) {
+function toolRoutes(context: Context, choice: SimpleStreamOptions["toolChoice"]) {
   const originals = new Set(context.tools?.map((tool) => tool.name));
   for (const message of context.messages) {
     if (message.role !== "assistant") continue;
@@ -63,6 +93,7 @@ function toolNames(context: Context, choice: SimpleStreamOptions["toolChoice"]) 
   }
   const outgoing = new Map<string, string>();
   const incoming = new Map<string, string>();
+  const contracts = new Map<string, ContractRoute>();
   for (const [original, alias] of nativeToolAliases) {
     // Reserve every original identity, including history-only/custom tools.
     if (
@@ -74,9 +105,118 @@ function toolNames(context: Context, choice: SimpleStreamOptions["toolChoice"]) 
     outgoing.set(original, alias);
     incoming.set(alias, original);
   }
+  for (const tool of context.tools ?? []) {
+    const contract = contractByHost.get(tool.name);
+    if (!contract || originals.has(contract.declaration.name)) continue;
+    // OMP's device-only write is not a filesystem capability. A pruned
+    // description also doesn't establish that filesystem write is available.
+    if (
+      tool.name === "write" &&
+      (!tool.description.trim() || tool.description.includes("xd://<tool>"))
+    )
+      continue;
+    const host = schemaFields.safeParse(toolParameters(tool));
+    if (!host.success) continue;
+    const field = host.data.properties?.i;
+    if (
+      host.data.required?.some((name) =>
+        name === "i" ? field === undefined : !contract.requiredHostArguments.includes(name),
+      )
+    )
+      continue;
+    let intent: ContractRoute["intent"];
+    if (field !== undefined) {
+      const parsed = stringProperty.safeParse(field);
+      if (!parsed.success) continue;
+      intent = { schema: parsed.data, required: host.data.required?.includes("i") ?? false };
+    }
+    const alias = contract.declaration.name;
+    contracts.set(tool.name, { contract, ...(intent ? { intent } : {}) });
+    incoming.set(alias, tool.name);
+  }
   return {
-    toNative: (name: string) => outgoing.get(name) ?? name,
-    fromNative: (name: string) => incoming.get(name) ?? name,
+    declarations(tool: Tool) {
+      // Keep the full host surface (including URI targets and complex searches)
+      // alongside the narrower native alias, not behind a validator fallback.
+      const host = {
+        name: outgoing.get(tool.name) ?? tool.name,
+        description: tool.description,
+        parameters: toolParameters(tool),
+      };
+      const route = contracts.get(tool.name);
+      if (!route) return [host];
+      const { declaration } = route.contract;
+      const schema = schemaFields.parse(declaration.parameters);
+      const parameters = route.intent
+        ? {
+            ...schema,
+            properties: { ...schema.properties, i: route.intent.schema },
+            required: route.intent.required ? [...(schema.required ?? []), "i"] : schema.required,
+          }
+        : schema;
+      return [{ name: declaration.name, description: declaration.description, parameters }, host];
+    },
+    allowedNames(name: string) {
+      const route = contracts.get(name);
+      return route ? [route.contract.declaration.name, name] : [outgoing.get(name) ?? name];
+    },
+    async replay(call: ToolCall, cwd: string) {
+      const route = contracts.get(call.name);
+      if (!route) return { name: outgoing.get(call.name) ?? call.name, args: call.arguments };
+      // A host read's :raw suffix can be a literal filename. Today's
+      // filesystem cannot establish what that suffix meant in an old call.
+      if (
+        call.name === "read" &&
+        (!("antigravityReadPath" in call) || call.antigravityReadPath !== call.arguments.path)
+      )
+        return { name: call.name, args: call.arguments };
+      try {
+        const { i, ...withoutIntent } = call.arguments;
+        const value = i ?? call.intent;
+        if (
+          route.intent &&
+          (value === undefined ? route.intent.required : typeof value !== "string")
+        ) {
+          return { name: call.name, args: call.arguments };
+        }
+        const args = await route.contract.encode(route.intent ? withoutIntent : call.arguments, cwd);
+        return {
+          name: route.contract.declaration.name,
+          args: { ...args, ...(route.intent && value !== undefined ? { i: value } : {}) },
+        };
+      } catch (error) {
+        if (error instanceof z.ZodError || error instanceof ConfigurationError)
+          return { name: call.name, args: call.arguments };
+        throw error;
+      }
+    },
+    async restore(call: ToolCall, cwd: string): Promise<ToolCall> {
+      const name = incoming.get(call.name);
+      if (name === undefined) return call;
+      const route = contracts.get(name);
+      if (!route) return { ...call, name };
+      const { i, ...withoutIntent } = call.arguments;
+      try {
+        if (route.intent && (i === undefined ? route.intent.required : typeof i !== "string"))
+          throw new ConfigurationError("Invalid tool intent: i must be a string");
+        const args = await route.contract.decode(
+          route.intent ? withoutIntent : call.arguments,
+          cwd,
+        );
+        const readPath = name === "read" && typeof args.path === "string" ? args.path : undefined;
+        return {
+          ...call,
+          name,
+          arguments: { ...args, ...(route.intent && i !== undefined ? { i } : {}) },
+          ...(readPath === undefined ? {} : { antigravityReadPath: readPath }),
+        };
+      } catch (error) {
+        if (!(error instanceof ConfigurationError)) throw error;
+        // OMP's provider argument-error marker is rejected before any tool
+        // runs, even with lenient validation. Keep the call ID for its result.
+        return { ...call, name, arguments: { __parseError: error.message } };
+      }
+    },
   };
 }
 
@@ -110,7 +250,8 @@ function nativeBranding(payload: unknown): unknown {
 
 /** Preserve original options and messages before the shared CCA builder rewrites them. */
 export const streamAntigravity: CustomStreamSimpleFn = (model, context, options) => {
-  const names = toolNames(context, options?.toolChoice);
+  const routes = toolRoutes(context, options?.toolChoice);
+  const cwd = options?.cwd ?? process.cwd();
   const source = streamSimple(buildModel({ ...toModelSpec(model), api: "google-gemini-cli" }), context, {
     ...options,
     onPayload: async (payload) => {
@@ -192,14 +333,14 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
           if (text.trim()) parts.push({ text });
           for (const block of message.content) {
             if (block.type === "toolCall") {
-              const name = names.toNative(block.name);
+              const { name, args } = await routes.replay(block, cwd);
               callNames.set(block.id, name);
               const thoughtSignature = signature(block.thoughtSignature);
               parts.push({
                 functionCall: {
                   ...(block.id ? { id: block.id } : {}),
                   ...(name ? { name } : {}),
-                  args: z.record(z.string(), z.json()).parse(block.arguments),
+                  args: part.parse(args),
                 },
                 ...(thoughtSignature ? { thoughtSignature } : {}),
               });
@@ -242,26 +383,11 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
           ],
         },
         ...(contents.length ? { contents } : {}),
-        tools: context.tools?.map((tool) => ({
-          functionDeclarations: [
-            {
-              name: names.toNative(tool.name),
-              description: tool.description,
-              parameters: z.json().parse(
-                JSON.parse(
-                  JSON.stringify(
-                    isArkSchema(tool.parameters)
-                      ? tool.parameters.toJsonSchema({
-                          target: "draft-2020-12",
-                          fallback: (value) => value.base,
-                        })
-                      : tool.parameters,
-                  ),
-                ),
-              ),
-            },
-          ],
-        })),
+        tools: context.tools?.flatMap((tool) =>
+          routes.declarations(tool).map(({ name, description, parameters }) => ({
+            functionDeclarations: [{ name, description, parameters: z.json().parse(parameters) }],
+          })),
+        ),
       };
       if (!contents.length) delete request.contents;
       // Replace the inherited tool policy even when no declarations are present.
@@ -280,7 +406,7 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
             throw new ConfigurationError("Native Antigravity tool choice requires a function");
           const name = "function" in choice ? choice.function.name : choice.name;
           mode = "ANY";
-          if (name) allowedFunctionNames = [names.toNative(name)];
+          if (name) allowedFunctionNames = routes.allowedNames(name);
         }
         request.toolConfig = {
           functionCallingConfig: { mode, ...(allowedFunctionNames ? { allowedFunctionNames } : {}) },
@@ -291,29 +417,47 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
     },
   });
   const output = createAssistantMessageEventStream();
-  const restore = (message: AssistantMessage): AssistantMessage => ({
+  const restoredCalls = new WeakMap<ToolCall, Promise<ToolCall>>();
+  const restoreCall = async (block: ToolCall): Promise<ToolCall> => {
+    let restored = restoredCalls.get(block);
+    if (!restored) {
+      restored = routes.restore(block, cwd);
+      restoredCalls.set(block, restored);
+    }
+    return { ...(await restored) };
+  };
+  const restore = async (message: AssistantMessage): Promise<AssistantMessage> => ({
     ...message,
     // Providers reuse their partial message/array/calls; never rename those in place.
-    content: message.content.map((block) =>
-      block.type === "toolCall" ? { ...block, name: names.fromNative(block.name) } : block,
+    content: await Promise.all(
+      message.content.map(async (block) => (block.type === "toolCall" ? restoreCall(block) : block)),
     ),
   });
   output.forwardLocalWorkFrom(source);
   void (async () => {
     try {
       for await (const event of source) {
-        if (event.type === "done") output.push({ ...event, message: restore(event.message) });
-        else if (event.type === "error") output.push({ ...event, error: restore(event.error) });
+        if (event.type === "done") output.push({ ...event, message: await restore(event.message) });
+        else if (event.type === "error")
+          output.push({ ...event, error: await restore(event.error) });
         else if (event.type === "toolcall_end")
           output.push({
             ...event,
-            partial: restore(event.partial),
-            toolCall: { ...event.toolCall, name: names.fromNative(event.toolCall.name) },
+            partial: await restore(event.partial),
+            toolCall: await restoreCall(event.toolCall),
           });
-        else output.push({ ...event, partial: restore(event.partial) });
+        else if (event.type === "toolcall_delta") {
+          const partial = await restore(event.partial);
+          const block = partial.content[event.contentIndex];
+          output.push({
+            ...event,
+            partial,
+            delta: block?.type === "toolCall" ? JSON.stringify(block.arguments) : event.delta,
+          });
+        } else output.push({ ...event, partial: await restore(event.partial) });
       }
       if (output.resultSettled) output.end();
-      else output.end(restore(await source.result()));
+      else output.end(await restore(await source.result()));
     } catch (error) {
       output.fail(error);
     } finally {

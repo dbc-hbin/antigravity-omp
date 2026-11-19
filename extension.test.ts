@@ -18,7 +18,7 @@ const cases: { id: string; choice?: ToolChoice; mode?: string; names?: string[] 
     id: "claude-sonnet-5-5",
     choice: { type: "function", name: "read" },
     mode: "ANY",
-    names: ["read_file"],
+    names: ["read_file", "read"],
   },
   { id: "claude-sonnet-4-6", choice: "auto", mode: "VALIDATED" },
 ];
@@ -170,7 +170,7 @@ test.each(cases)(
         wire.request.tools?.flatMap((tool) =>
           tool.functionDeclarations.map((declaration) => declaration.name),
         ),
-      ).toEqual(["inspect", "read_file"]);
+      ).toEqual(["inspect", "read_file", "read"]);
     } finally {
       await server.stop(true);
     }
