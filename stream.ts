@@ -18,6 +18,7 @@ import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-refere
 import { z } from "zod";
 import { toolContracts } from "./tool-contracts";
 import { nativeModelDetails } from "./native-models";
+import { agyBody } from "./prompts/agy";
 import { envelope, nativeWireRequest } from "./wire";
 
 export const API_ID = "antigravity-cli";
@@ -220,8 +221,70 @@ function toolRoutes(context: Context, choice: SimpleStreamOptions["toolChoice"])
   };
 }
 
-/** Change only identity text in the final system instruction, after other extensions. */
-function nativeBranding(payload: unknown): unknown {
+const advertisedTools = z
+  .array(
+    z.object({
+      functionDeclarations: z
+        .array(z.object({ name: z.string(), description: z.string().optional() }))
+        .optional(),
+    }),
+  )
+  .optional();
+const agyPresetTag = "AGY_MODEL_PRESET";
+const ompToolInventory =
+  /^# Tool Inventory\r?\n[^\r\n]*(?:\r?\n(?:- | {2})[^\r\n]*)*|^## functions\r?\n\r?\nnamespace functions \{\r?\n[\s\S]*?^\} \/\/ namespace functions(?=\r?$)/m;
+
+function antigravitySystemPrompt(text: string, tools: unknown): string {
+  const runtime = /\r?\n([⁂§]) Runtime\r?\n[\s\S]*?(?=\r?\n\1 Tool Policy\r?\n)/.exec(text);
+  if (!runtime) return text;
+  const head = text.slice(0, runtime.index);
+  const profile =
+    /^([⁂§] Role\r?\n)?<(AGY_MODEL_PRESET|om[op]-model-preset)>\r?\n([\s\S]*?)\r?\n<\/\2>(?=\r?$)/m.exec(
+      head,
+    );
+  const role =
+    profile ??
+    /^You are omp's trusted coding assistant\.(?=\r?\n\r?\n# Engineering\r?\n)/.exec(head) ??
+    /^([⁂§] Role\r?\n)You are omp's trusted coding assistant\.(?=\r?$)/m.exec(head);
+  // Explicit custom prompts do not have an OMP-owned role to replace.
+  if (!role) return text;
+  const newline = runtime[0].startsWith("\r\n") ? "\r\n" : "\n";
+  let nextHead = head;
+  if (profile?.[2] !== agyPresetTag) {
+    // Superkit appends specialist execution rules inside its marked profile.
+    const scope = profile?.[3]?.match(/(?:\r?\n){2}## Delegated execution\r?\n[\s\S]*$/)?.[0] ?? "";
+    const preset = [
+      `<${agyPresetTag}>`,
+      agyBody.replaceAll("\n", newline) + scope,
+      `</${agyPresetTag}>`,
+    ].join(newline);
+    nextHead =
+      head.slice(0, role.index) + (role[1] ?? "") + preset + head.slice(role.index + role[0].length);
+  }
+
+  // The final declarations already account for active tools, alias collisions,
+  // and any capability/description edits made by the awaited payload hooks.
+  const declared = advertisedTools.safeParse(tools);
+  if (!declared.success) return nextHead + text.slice(runtime.index);
+  const descriptions = (declared.data ?? []).flatMap(({ functionDeclarations = [] }) =>
+    functionDeclarations.map(({ name, description }) =>
+      description ? `- \`${name}\`: ${description.replace(/\r?\n/g, `${newline}  `)}` : `- \`${name}\``,
+    ),
+  );
+  const inventory = descriptions.length ? ["# Tool Inventory", ...descriptions].join(newline) : "";
+  const runtimeText = runtime[0];
+  // Injected skills and rules precede the host's Internal URLs section.
+  const toolAreaAt = Math.max(0, runtimeText.lastIndexOf(`${newline}# Internal URLs${newline}`));
+  const toolArea = runtimeText.slice(toolAreaAt);
+  const nextToolArea = ompToolInventory.test(toolArea)
+    ? toolArea.replace(ompToolInventory, () => inventory)
+    : toolArea + (inventory ? `${newline}${inventory}${newline}` : "");
+  return nextHead + runtimeText.slice(0, toolAreaAt) + nextToolArea
+    + text.slice(runtime.index + runtimeText.length);
+}
+
+/** Project the final system instruction after the other extensions have run. */
+function nativeSystemInstruction(payload: unknown, isAntigravity: boolean): unknown {
   if (!payload || typeof payload !== "object" || !("request" in payload)) return payload;
   const request = payload.request;
   if (!request || typeof request !== "object" || !("systemInstruction" in request)) return payload;
@@ -229,10 +292,12 @@ function nativeBranding(payload: unknown): unknown {
   if (!instruction || typeof instruction !== "object" || !("parts" in instruction)) return payload;
   if (!Array.isArray(instruction.parts)) return payload;
   let changed = false;
-  const parts = instruction.parts.map((part: unknown) => {
+  const tools = "tools" in request ? request.tools : undefined;
+  const parts = instruction.parts.map((part: unknown, index) => {
     if (!part || typeof part !== "object" || !("text" in part) || typeof part.text !== "string")
       return part;
-    const text = part.text
+    const prompt = isAntigravity && index === 0 ? antigravitySystemPrompt(part.text, tools) : part.text;
+    const text = prompt
       .replace(
         /^(⁂ Role\r?\n)You are omp's trusted coding assistant\.(?=\r?$)/m,
         "$1You are Antigravity's trusted coding assistant.",
@@ -413,7 +478,10 @@ export const streamAntigravity: CustomStreamSimpleFn = (model, context, options)
         };
       }
       const native = nativeWireRequest({ ...parsed, request });
-      return nativeBranding((await options?.onPayload?.(native, model)) ?? native);
+      return nativeSystemInstruction(
+        (await options?.onPayload?.(native, model)) ?? native,
+        model.provider === "google-antigravity",
+      );
     },
   });
   const output = createAssistantMessageEventStream();

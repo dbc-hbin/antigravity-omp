@@ -12,8 +12,14 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { loadExtension } from "./extension-fixture";
 import { rememberNativeModels } from "./native-models";
+import { agyBody } from "./prompts/agy";
+import { toolContracts } from "./tool-contracts";
+import { envelope } from "./wire";
+
+const geminiPresetTag = "AGY_MODEL_PRESET";
 
 const image = {
   type: "image" as const,
@@ -55,7 +61,7 @@ async function capture(
   modelId = "gemini-3.8-flash",
   response = 'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"OK"}]},"finishReason":"STOP"}]}}\n\n',
 ) {
-  const { projected, payloadHook } = await loadExtension();
+  const { models, projected, payloadHook } = await loadExtension();
   const source = projected.find((model) => model.id === modelId);
   if (!source) throw new Error("Missing fixture model");
   const row = {
@@ -66,12 +72,9 @@ async function capture(
     thinkingBudget: 1000,
     ...details,
   };
+  const wireIds = Object.keys(models.find(({ id }) => id === modelId)?.antigravityWireProfiles ?? {});
   rememberNativeModels("Bearer local-test-token", {
-    models: {
-      "gemini-3.8-flash-low": row,
-      "gemini-3.8-flash-high": row,
-      "claude-sonnet-5-5-high": row,
-    },
+    models: Object.fromEntries([modelId, ...wireIds].map((id) => [id, row])),
   });
   let body: unknown;
   const server = Bun.serve({
@@ -380,6 +383,115 @@ test("brands the final extension-rewritten prompt without changing hook-owned da
   });
   expect(systemInstruction).toEqual(before);
 });
+
+test.each([
+  { modelId: "gemini-3.8-flash", inline: false, profile: "default" },
+  { modelId: "gemini-3.8-flash", inline: true, profile: "agy" },
+  { modelId: "claude-sonnet-5-5", inline: false, profile: "superkit" },
+  { modelId: "gpt-oss-120b", inline: false, profile: "default" },
+])(
+  "sends the AGY preset and final tool inventory for $modelId with a $profile prompt",
+  async ({ modelId, inline, profile }) => {
+    const hostRole = "You are omp's trusted coding assistant.";
+    const marker = `<${geminiPresetTag}>`;
+    const endMarker = `</${geminiPresetTag}>`;
+    const existingBody = "Already rendered by a host extension.";
+    const otherBody = "Model-specific Claude instructions.";
+    const delegated = "\n\n## Delegated execution\n\nFollow the child's read-only limits.";
+    const role =
+      profile === "agy"
+        ? `${marker}\n${existingBody}\n${endMarker}`
+        : profile === "superkit"
+          ? `<omp-model-preset>\n${otherBody}${delegated}\n</omp-model-preset>`
+          : `${hostRole}\n\n# Engineering\nKeep project conventions.`;
+    const inventory = inline
+      ? "## functions\n\nnamespace functions {\n\n// Untranslated shell description\ntype bash = ();\n\n} // namespace functions"
+      : "# Tool Inventory\nread, bash, stale_tool";
+    const projectRule = "<generic-rules>\n# Tool Inventory\nExample from a project rule.\n</generic-rules>";
+    const host = [
+      role,
+      `⁂ Runtime\n${projectRule}\n\n# Internal URLs\nUse xd:// for mounted tools.`,
+      inventory,
+      "# xd:// Tool Devices\nUse the host permission policy.",
+      "⁂ Tool Policy\nKeep tool restrictions.",
+      "⁂ Workflow\nVerify the result.",
+    ].join("\n\n");
+    const assignment = "Read-only assignment: do not edit.";
+    const shellDescription = "Run a shell command with the current session policy.";
+    const reasoning = THINKING_EFFORTS.find((effort) => effort === "high");
+    if (!reasoning) throw new Error("Missing high thinking effort");
+    const read = toolContracts.find(({ hostName }) => hostName === "read")?.declaration;
+    if (!read) throw new Error("Missing native read declaration");
+    const { body, result } = await capture(
+      {
+        systemPrompt: [host, assignment],
+        messages: [{ role: "user", content: "Show the tools", timestamp: 0 }],
+        tools: [
+          { name: "read", description: "Read paths including xd://", parameters: { type: "object" } },
+          { name: "bash", description: "Untranslated shell description", parameters: { type: "object" } },
+          { name: "stale_tool", description: "This tool is removed by the hook.", parameters: { type: "object" } },
+        ],
+      },
+      {
+        reasoning,
+        onPayload: (payload) => {
+          const wire = envelope.parse(payload);
+          return {
+            ...wire,
+            request: {
+              ...wire.request,
+              tools: wire.request.tools?.flatMap(({ functionDeclarations }) =>
+                functionDeclarations.flatMap((tool) =>
+                  tool.name === "stale_tool"
+                    ? []
+                    : [
+                        {
+                          functionDeclarations: [
+                            tool.name === "run_command"
+                              ? { ...tool, description: shellDescription }
+                              : tool,
+                          ],
+                        },
+                      ],
+                ),
+              ),
+            },
+          };
+        },
+      },
+      {},
+      modelId,
+    );
+    expect(result).toMatchObject({ stopReason: "stop" });
+    const wire = envelope.parse(body);
+    const declarations = wire.request.tools?.flatMap(({ functionDeclarations }) =>
+      functionDeclarations.map(({ name, description }) => [name, description]),
+    );
+    expect(declarations).toEqual([
+      [read.name, read.description],
+      ["read", "Read paths including xd://"],
+      ["run_command", shellDescription],
+    ]);
+    const { parts: [{ text }] } = z
+      .object({ role: z.literal("user"), parts: z.tuple([z.object({ text: z.string() })]) })
+      .parse(wire.request.systemInstruction);
+    const [, emittedPreset, ...duplicates] = text.split(marker);
+    expect(duplicates).toEqual([]);
+    expect(emittedPreset?.split(endMarker)[0]?.trim()).toBe(
+      profile === "agy" ? existingBody : agyBody + (profile === "superkit" ? delegated : ""),
+    );
+    expect(text).not.toContain(hostRole);
+    expect(text).not.toContain(otherBody);
+    expect(text).not.toContain("stale_tool");
+    expect(text).not.toContain("Untranslated shell description");
+    expect(text).toContain(`- \`${read.name}\`: ${read.description}`);
+    expect(text).toContain(`- \`run_command\`: ${shellDescription}`);
+    expect(text).toContain(assignment);
+    expect(text).toContain(projectRule);
+    expect(text).toContain("⁂ Tool Policy\nKeep tool restrictions.");
+    expect(text).toContain("# xd:// Tool Devices\nUse the host permission policy.");
+  },
+);
 
 test.each([".", " running on Gemini 4 Argon."])("preserves ULW roles, markers and policy while branding its introduction (%s)", async (suffix) => {
   const prompt = [
